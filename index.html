@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sd.cpp</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.4 system-ui, sans-serif;
+    background: #15171a;
+    color: #e6e6e6;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  #bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    background: #1c1f24;
+    border-bottom: 1px solid #2c3038;
+    padding: 12px;
+  }
+  #controls {
+    width: 100%;
+    max-width: 512px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  input, textarea, button {
+    font: inherit;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid #3a3f48;
+    background: #23262c;
+    color: #e6e6e6;
+  }
+  input:focus, textarea:focus { outline: none; border-color: #5b8cff; }
+  #host { width: 100%; }
+  #prompt-row { display: flex; gap: 8px; align-items: stretch; }
+  #prompt { flex: 1; resize: vertical; min-height: 64px; }
+  button {
+    cursor: pointer;
+    background: #5b8cff;
+    border-color: #5b8cff;
+    color: #fff;
+    font-weight: 600;
+  }
+  button:hover { background: #4a7bf0; }
+  label { font-size: 12px; color: #9aa0aa; }
+  #gallery {
+    width: 100%;
+    max-width: 512px;
+    padding: 16px 12px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .frame {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background: #1c1f24;
+    border: 1px solid #2c3038;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .frame img { width: 100%; height: 100%; display: block; object-fit: contain; }
+  .spinner {
+    width: 36px;
+    height: 36px;
+    border: 4px solid #3a3f48;
+    border-top-color: #5b8cff;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status { font-size: 12px; color: #9aa0aa; }
+  .error { color: #ff7a7a; padding: 16px; text-align: center; font-size: 13px; }
+  .caption { font-size: 13px; word-wrap: break-word; white-space: pre-wrap; }
+  .caption .neg { color: #9aa0aa; }
+  .actions { display: flex; gap: 8px; }
+  button.mini {
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 10px;
+    background: #2b2f37;
+    border-color: #3a3f48;
+    color: #cfd3da;
+  }
+  button.mini:hover { background: #353a44; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <form id="controls" autocomplete="off">
+      <div>
+        <label for="host">Server (host:port)</label>
+        <input id="host" type="text" value="localhost:1234" spellcheck="false">
+      </div>
+      <div id="prompt-row">
+        <textarea id="prompt" placeholder="Positive prompt" spellcheck="false" rows="3" autofocus></textarea>
+        <button type="submit">Generate</button>
+      </div>
+      <input id="negative" type="text" placeholder="Negative prompt (optional)" spellcheck="false">
+    </form>
+  </div>
+  <div id="gallery"></div>
+
+<script>
+(function () {
+  const hostEl = document.getElementById("host");
+  const promptEl = document.getElementById("prompt");
+  const negEl = document.getElementById("negative");
+  const form = document.getElementById("controls");
+  const gallery = document.getElementById("gallery");
+
+  const HOST_KEY = "sdweb.host";
+  const fragment = decodeURIComponent(location.hash.replace(/^#/, "")).trim();
+  const saved = localStorage.getItem(HOST_KEY);
+  if (fragment) hostEl.value = fragment;
+  else if (saved) hostEl.value = saved;
+  hostEl.addEventListener("change", () => localStorage.setItem(HOST_KEY, hostEl.value.trim()));
+
+  const queue = [];
+  let processing = false;
+
+  function baseUrl(raw) {
+    let h = raw.trim().replace(/\/+$/, "");
+    if (!/^https?:\/\//i.test(h)) h = "http://" + h;
+    return h;
+  }
+
+  function makeCard(prompt, negative) {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const frame = document.createElement("div");
+    frame.className = "frame";
+    const spinner = document.createElement("div");
+    spinner.className = "spinner";
+    frame.appendChild(spinner);
+
+    const status = document.createElement("div");
+    status.className = "status";
+    status.textContent = "queued…";
+
+    const caption = document.createElement("div");
+    caption.className = "caption";
+    caption.textContent = prompt;
+    if (negative) {
+      const neg = document.createElement("div");
+      neg.className = "neg";
+      neg.textContent = "neg: " + negative;
+      caption.appendChild(neg);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    const again = document.createElement("button");
+    again.type = "button";
+    again.className = "mini";
+    again.textContent = "↻ Again";
+    again.title = "Generate another with the same prompt";
+    again.addEventListener("click", () => enqueue(prompt, negative));
+
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "mini";
+    edit.textContent = "✎ Edit";
+    edit.title = "Load this prompt back into the inputs";
+    edit.addEventListener("click", () => {
+      promptEl.value = prompt;
+      negEl.value = negative;
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      promptEl.focus();
+    });
+
+    actions.appendChild(again);
+    actions.appendChild(edit);
+
+    card.appendChild(frame);
+    card.appendChild(status);
+    card.appendChild(caption);
+    card.appendChild(actions);
+    gallery.insertBefore(card, gallery.firstChild);
+    return { card, frame, status };
+  }
+
+  async function runJob(job) {
+    job.ui.status.textContent = "generating…";
+    const body = { prompt: job.prompt, size: "512x512" };
+    if (job.negative) body.negative_prompt = job.negative;
+
+    try {
+      const res = await fetch(baseUrl(job.host) + "/v1/images/generations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status + " " + res.statusText);
+      const data = await res.json();
+      const b64 = data && data.data && data.data[0] && data.data[0].b64_json;
+      if (!b64) throw new Error("No image in response");
+
+      const img = new Image();
+      img.src = "data:image/png;base64," + b64;
+      job.ui.frame.innerHTML = "";
+      job.ui.frame.appendChild(img);
+      job.ui.status.remove();
+    } catch (err) {
+      job.ui.frame.innerHTML =
+        '<div class="error">Failed: ' + String(err.message || err) + "</div>";
+      job.ui.status.remove();
+    }
+  }
+
+  async function processNext() {
+    if (processing) return;
+    processing = true;
+    while (queue.length) {
+      await runJob(queue.shift());
+    }
+    processing = false;
+  }
+
+  function enqueue(prompt, negative) {
+    const host = hostEl.value.trim();
+    localStorage.setItem(HOST_KEY, host);
+    const ui = makeCard(prompt, negative);
+    queue.push({ host, prompt, negative, ui });
+    processNext();
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const prompt = promptEl.value.trim();
+    if (!prompt) return;
+    enqueue(prompt, negEl.value.trim());
+    promptEl.value = "";
+    promptEl.focus();
+  });
+
+  // Enter submits; Shift+Enter inserts a newline.
+  promptEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
+})();
+</script>
+</body>
+</html>
